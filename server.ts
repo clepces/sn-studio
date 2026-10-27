@@ -154,7 +154,7 @@ const templates: [string, string, string][] = [
 ];
 
 function extractTokens(text: string): string[] {
-  const regex = /\[VALUE\d*\]|%s|%d|%f|\{\d+\}/g;
+  const regex = /\[VALUE\d*\]|%[0-9\.]*[sdf]|\{\d+\}/g;
   const found: string[] = [];
   let m: RegExpExecArray | null;
   while ((m = regex.exec(text)) !== null) {
@@ -385,7 +385,9 @@ app.get('/api/system/health', (_req, res) => {
 
 app.get('/api/system/environment', (_req, res) => {
   const activeDetailed = getDetailedMods();
-  const totalActiveRam = activeDetailed.reduce((sum, m) => sum + m.ramMb, 0);
+  const baseEngineRam = 1400;
+  const modsRam = activeDetailed.reduce((sum, m) => sum + m.ramMb, 0);
+  const totalActiveRam = baseEngineRam + modsRam;
   const laaCeiling = 3250;
 
   jsonEnvelope(res, {
@@ -494,7 +496,12 @@ app.post('/api/system/deploy-native', (_req, res) => {
 });
 
 app.post('/api/engine/convert', (req, res) => {
-  const filePath = req.body.file_path || req.body.input_path || 'tests/fixtures/sample_demo.entity';
+  const rawPath = String(req.body.file_path || req.body.input_path || 'tests/fixtures/sample_demo.entity');
+  if (rawPath.includes('..') || /^[a-zA-Z]:/.test(rawPath) || rawPath.startsWith('\\\\')) {
+    errorEnvelope(res, 'Ruta no permitida: Path Traversal detectado en conversor.');
+    return;
+  }
+  const filePath = path.normalize(rawPath).replace(/^[/\\]+/, '');
   const resourceType = req.body.resource_type || req.body.type || 'entity';
   const direction = req.body.direction || 'bin_to_txt';
   const outputPath = req.body.output_path || `${filePath}.converted`;
@@ -504,7 +511,7 @@ app.post('/api/engine/convert', (req, res) => {
     outputPath,
     duration_ms: 38,
     mode: `${direction} (${resourceType})`,
-    checksum: crypto.createHash('sha256').update(filePath + Date.now()).digest('hex'),
+    checksum: crypto.createHash('sha256').update(filePath + 'solaris-nexus-studio').digest('hex'),
   });
 });
 
@@ -552,7 +559,20 @@ app.get('/api/strings/project-strings', (req, res) => {
   const offset = Math.max(0, Number(req.query.offset) || 0);
   const status = req.query.status && req.query.status !== 'ALL' ? String(req.query.status) : null;
 
-  const project = projectsList.find((p) => p.project_id === projectId) || projectsList[0];
+  const project = projectsList.find((p) => p.project_id === projectId) || null;
+  if (!project) {
+    jsonEnvelope(res, {
+      project: null,
+      strings: [],
+      pagination: {
+        limit,
+        offset,
+        count: 0,
+        total: 0,
+      },
+    });
+    return;
+  }
 
   let filtered = projectStrings;
   if (status) {
@@ -718,6 +738,14 @@ app.post('/api/strings/validate', (req, res) => {
     });
   }
 
+  if (/(?<!")"(?!")/.test(translated) && translated.includes('"')) {
+    issues.push({
+      type: 'QUOTE_SYNTAX',
+      severity: 'WARNING',
+      message: 'ADVERTENCIA: Contiene comillas dobles sin escapar. Iron Engine requiere comillas dobles repetidas "" para evitar errores de sintaxis.',
+    });
+  }
+
   const expansionRatio = original.length > 0 ? translated.length / original.length : 1;
   const expansionRisk = expansionRatio > 1.4 ? 'HIGH' : expansionRatio > 1.2 ? 'MEDIUM' : 'LOW';
 
@@ -732,7 +760,8 @@ app.post('/api/strings/export', (req, res) => {
   const entries = req.body.entries || projectStrings;
   let str = 'TXT\r\nNumStrings ' + entries.length + '\r\n';
   for (const e of entries) {
-    const val = (e.translated && e.translated.trim()) ? e.translated : e.original;
+    const rawVal = (e.translated && e.translated.trim()) ? e.translated : e.original;
+    const val = rawVal.replace(/"/g, '""');
     str += `StringInfo\r\n\tID "${e.id || e.key}"\r\n\tValue "${val}"\r\n`;
   }
 
@@ -747,19 +776,26 @@ app.post('/api/strings/export', (req, res) => {
 });
 
 app.post('/api/strings/create-project', (req, res) => {
-  const { name, version, type, path: filePath } = req.body;
-  if (!name) {
+  const { name, version, type, path: filePath, target_file_path, base_file_path } = req.body;
+  if (!name || typeof name !== 'string' || name.trim() === '') {
     errorEnvelope(res, 'El nombre del proyecto es obligatorio.');
     return;
   }
 
+  const rawPath = String(filePath || target_file_path || base_file_path || 'Localizations/es/String/English.str');
+  if (rawPath.includes('..') || /^[a-zA-Z]:/.test(rawPath) || rawPath.startsWith('\\\\')) {
+    errorEnvelope(res, 'Ruta no permitida: Path Traversal o ruta absoluta fuera del sandbox detectada.');
+    return;
+  }
+  const cleanPath = path.normalize(rawPath).replace(/^[/\\]+/, '');
+
   const newProjId = 'proj-' + crypto.randomBytes(4).toString('hex');
   const newProject = {
     project_id: newProjId,
-    name,
+    name: name.trim(),
     version: version || 'v1.85 Rebellion',
-    base_file_path: filePath || 'Localizations/es/String/English.str',
-    target_file_path: filePath || 'Localizations/es/String/Spanish.str',
+    base_file_path: cleanPath,
+    target_file_path: cleanPath,
     total_strings: 100,
     translated_count: 0,
     type: type || 'mod',
@@ -773,22 +809,28 @@ app.post('/api/strings/create-project', (req, res) => {
 app.post('/api/strings/delete-project', (req, res) => {
   const { project_id } = req.body;
   projectsList = projectsList.filter((p) => p.project_id !== project_id);
-  if (projectsList.length === 0) {
-    // Keep at least the core project
-    projectsList = [
-      {
-        project_id: 'sins-rebellion-core',
-        name: 'Sins of a Solar Empire: Rebellion (Vanilla Base)',
-        version: 'v1.85 Rebellion',
-        base_file_path: 'Localizations/en/String/English.str',
-        target_file_path: 'Localizations/es/String/Spanish.str',
-        total_strings: TOTAL_STRINGS,
-        translated_count: projectStrings.filter((s) => s.status === 'TRANSLATED').length,
-        updated_at: new Date().toISOString(),
-      },
-    ];
-  }
+  // Do NOT auto-resurrect! Respect the empty workspace
   jsonEnvelope(res, { success: true, project_id, message: 'Proyecto eliminado con éxito.' });
+});
+
+app.post('/api/strings/seed-fixtures', (_req, res) => {
+  projectsList = [
+    {
+      project_id: 'sins-rebellion-core',
+      name: 'Sins of a Solar Empire: Rebellion (Vanilla Base)',
+      version: 'v1.85 Rebellion',
+      base_file_path: 'Localizations/en/String/English.str',
+      target_file_path: 'Localizations/es/String/Spanish.str',
+      total_strings: TOTAL_STRINGS,
+      translated_count: projectStrings.filter((s) => s.status === 'TRANSLATED').length,
+      updated_at: new Date().toISOString(),
+    },
+  ];
+  jsonEnvelope(res, {
+    success: true,
+    message: 'Proyecto canónico vanilla y fixtures restaurados con éxito.',
+    projects: projectsList,
+  });
 });
 
 // 3. Mods & VFS Endpoints
@@ -937,15 +979,15 @@ app.post('/api/galaxy/generate', (req, res) => {
 
   const star = { name: 'Estrella Central Solaris', type: 'Yellow', x: 0, y: 0 };
 
-  const radius = 220;
+  const radius = 38000;
   for (let i = 0; i < planetCount; i++) {
     const angle = (2 * Math.PI * i) / planetCount;
-    // Add jitter to make realistic star cluster
-    const r = radius + (Math.sin(i * 3) * 45);
+    const r = radius + (Math.sin(i * 3) * 7500);
     const x = Math.round(Math.cos(angle) * r);
     const y = Math.round(Math.sin(angle) * r);
     const type = planetTypes[i % planetTypes.length]!;
     const name = `Planeta_${i + 1}_${type}`;
+    const isHomePlanet = i === 0 || i === Math.floor(planetCount / 2);
 
     planets.push({
       id: `planet_${i}`,
@@ -955,13 +997,16 @@ app.post('/api/galaxy/generate', (req, res) => {
       x,
       y,
       radius: 12,
+      isHomePlanet,
     });
   }
 
-  // Connect in ring + cross bridges so no isolated planets exist
+  // Connect in ring + cross bridges with both source/target and from/to for 100% BFS connectivity
   for (let i = 0; i < planetCount; i++) {
     const nextIdx = (i + 1) % planetCount;
     phaseLanes.push({
+      source: planets[i]!.name,
+      target: planets[nextIdx]!.name,
       from: planets[i]!.name,
       to: planets[nextIdx]!.name,
     });
@@ -969,13 +1014,20 @@ app.post('/api/galaxy/generate', (req, res) => {
 
   // Add 2 internal chords
   if (planetCount >= 6) {
+    const midIdx = Math.floor(planetCount / 2);
     phaseLanes.push({
+      source: planets[0]!.name,
+      target: planets[midIdx]!.name,
       from: planets[0]!.name,
-      to: planets[Math.floor(planetCount / 2)]!.name,
+      to: planets[midIdx]!.name,
     });
+    const q1Idx = Math.floor(planetCount / 4);
+    const q3Idx = Math.floor((3 * planetCount) / 4);
     phaseLanes.push({
-      from: planets[Math.floor(planetCount / 4)]!.name,
-      to: planets[Math.floor((3 * planetCount) / 4)]!.name,
+      source: planets[q1Idx]!.name,
+      target: planets[q3Idx]!.name,
+      from: planets[q1Idx]!.name,
+      to: planets[q3Idx]!.name,
     });
   }
 

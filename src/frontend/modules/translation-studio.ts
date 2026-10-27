@@ -33,6 +33,9 @@ declare global {
       openDeleteConfirmModal: (projectId?: string) => void;
       closeDeleteConfirmModal: () => void;
       syncNavigationState: (isLive: boolean) => void;
+      loadDemoData: () => Promise<void>;
+      exportStrFile: () => void;
+      handleStrUpload: (e: Event) => void;
     };
   }
 }
@@ -78,21 +81,34 @@ export const TranslationStudio = (() => {
       const json = await res.json() as { success: boolean; data?: WorkspacePayload };
       if (json.success && json.data) {
         workspaceData = json.data;
-        renderWorkspaceProjects(workspaceData.projects || []);
+        const projects = workspaceData.projects || [];
+        renderWorkspaceProjects(projects);
         renderDiscoveredFiles(workspaceData.discovered_files || {});
 
         const countBadge = document.getElementById('workspace-projects-count');
-        if (countBadge) countBadge.innerText = `${(workspaceData.projects || []).length} Proyectos`;
+        if (countBadge) countBadge.innerText = `${projects.length} Proyectos`;
 
-        // Validación de sesión activa: Si existe proyecto guardado en sessionStorage, restaurar live editor
-        const savedProject = sessionStorage.getItem(STORAGE_KEY_LIVE_PROJECT);
-        if (savedProject) {
-          await selectProject(savedProject, true);
-        } else if ((workspaceData.projects || []).length > 0 && !currentProject) {
-          const firstProj = workspaceData.projects![0];
-          if (firstProj) {
-            await selectProject(firstProj.project_id, false);
-            syncNavigationState(false);
+        if (projects.length === 0) {
+          currentProject = null;
+          state.allEntries = [];
+          state.filteredEntries = [];
+          sessionStorage.removeItem(STORAGE_KEY_LIVE_PROJECT);
+          syncNavigationState(false);
+          renderVirtualGrid();
+          updateTelemetry();
+        } else {
+          // Validación de sesión activa: Si existe proyecto guardado en sessionStorage y aún existe, restaurar live editor
+          const savedProjectId = sessionStorage.getItem(STORAGE_KEY_LIVE_PROJECT);
+          const savedProjectExists = savedProjectId ? projects.some(p => p.project_id === savedProjectId) : false;
+          if (savedProjectId && savedProjectExists) {
+            await selectProject(savedProjectId, true);
+          } else {
+            if (savedProjectId) sessionStorage.removeItem(STORAGE_KEY_LIVE_PROJECT);
+            const firstProj = projects[0];
+            if (firstProj && (!currentProject || !projects.some(p => p.project_id === currentProject?.project_id))) {
+              await selectProject(firstProj.project_id, false);
+              syncNavigationState(false);
+            }
           }
         }
       }
@@ -110,11 +126,22 @@ export const TranslationStudio = (() => {
 
     if (!projects || projects.length === 0) {
       container.innerHTML = `
-        <div class="str-project-card" style="text-align: center; padding: 24px;">
-          <div style="font-size: 1.5rem; margin-bottom: 6px;">📂</div>
-          <div style="font-weight: 700; font-size: 0.88rem; color: var(--text-main);">No hay proyectos de traducción</div>
-          <div style="font-size: 0.74rem; color: var(--text-secondary); margin-top: 4px;">
-            Crea uno nuevo o importa un archivo .str para comenzar.
+        <div class="str-project-card" style="text-align: center; padding: 32px 20px; grid-column: 1 / -1;">
+          <div style="font-size: 2rem; margin-bottom: 8px;">📂</div>
+          <div style="font-weight: 700; font-size: 0.95rem; color: var(--text-main); margin-bottom: 4px;">No hay proyectos de traducción</div>
+          <div style="font-size: 0.8rem; color: var(--text-secondary); max-width: 420px; margin: 0 auto 16px;">
+            El espacio de trabajo está limpio. Crea uno nuevo o restaura el proyecto canónico de ejemplo.
+          </div>
+          <div style="display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;">
+            <button class="btn-reagle btn-reagle-primary" data-action="workspace:new-str">
+              ✨ Crear Nuevo Proyecto .str
+            </button>
+            <button class="btn-reagle" data-action="workspace:seed-fixtures" style="border: 1px solid var(--text-blue); color: var(--text-blue);">
+              ⚡ Restaurar Proyecto Vanilla Base
+            </button>
+            <button class="btn-reagle" data-action="workspace:upload">
+              📁 Importar Archivo .str
+            </button>
           </div>
         </div>
       `;
@@ -594,6 +621,17 @@ export const TranslationStudio = (() => {
       clearInterval(deleteCountdownInterval);
       deleteCountdownInterval = null;
     }
+
+    const btnDigital = document.getElementById('btn-delete-digital') as HTMLButtonElement | null;
+    const btnPhysical = document.getElementById('btn-delete-physical') as HTMLButtonElement | null;
+    if (btnDigital) {
+      btnDigital.disabled = true;
+      btnDigital.textContent = '⏳ Espera (5s)...';
+    }
+    if (btnPhysical) {
+      btnPhysical.disabled = true;
+      btnPhysical.textContent = '⏳ Espera (5s)...';
+    }
   }
 
   /**
@@ -621,7 +659,11 @@ export const TranslationStudio = (() => {
         closeProjectSettingsModal();
 
         const activeLiveId = sessionStorage.getItem(STORAGE_KEY_LIVE_PROJECT);
-        if (activeLiveId === targetId) {
+        if (activeLiveId === targetId || (currentProject && currentProject.project_id === targetId)) {
+          sessionStorage.removeItem(STORAGE_KEY_LIVE_PROJECT);
+          currentProject = null;
+          state.allEntries = [];
+          state.filteredEntries = [];
           exitLiveEditor();
         }
 
@@ -637,22 +679,37 @@ export const TranslationStudio = (() => {
   }
 
   function updateTelemetry(): void {
-    if (!state.allEntries) return;
-
-    const total = state.allEntries.length;
-    const translated = state.allEntries.filter(e => e.translated && e.translated.trim() !== '').length;
-    const withTokens = state.allEntries.filter(e => e.tokens && e.tokens.length > 0).length;
-    const percent = total > 0 ? Math.round((translated / total) * 100) : 0;
-
     const numStringsEl = document.getElementById('telemetry-total-strings');
     const coverageEl = document.getElementById('telemetry-coverage-percent');
     const coverageDesc = document.getElementById('telemetry-coverage-desc');
     const tokensEl = document.getElementById('telemetry-tokens-count');
 
-    if (numStringsEl) numStringsEl.innerText = total.toLocaleString();
-    if (coverageEl) coverageEl.innerText = `${percent}%`;
-    if (coverageDesc) coverageDesc.innerText = `${(total - translated).toLocaleString()} cadenas pendientes`;
-    if (tokensEl) tokensEl.innerText = `${withTokens} con Tokens`;
+    if (state.allEntries && state.allEntries.length > 0) {
+      const total = state.allEntries.length;
+      const translated = state.allEntries.filter(e => e.translated && e.translated.trim() !== '').length;
+      const withTokens = state.allEntries.filter(e => e.tokens && e.tokens.length > 0).length;
+      const percent = total > 0 ? Math.round((translated / total) * 100) : 0;
+
+      if (numStringsEl) numStringsEl.innerText = total.toLocaleString();
+      if (coverageEl) coverageEl.innerText = `${percent}%`;
+      if (coverageDesc) coverageDesc.innerText = `${(total - translated).toLocaleString()} cadenas pendientes`;
+      if (tokensEl) tokensEl.innerText = `${withTokens} con Tokens`;
+    } else if (currentProject) {
+      const total = parseInt(String(currentProject.total_strings || currentProject.total_entries || 0), 10);
+      const translated = parseInt(String(currentProject.translated_count || 0), 10);
+      const withTokens = parseInt(String(currentProject.tokens_count || 0), 10);
+      const percent = total > 0 ? Math.round((translated / total) * 100) : 0;
+
+      if (numStringsEl) numStringsEl.innerText = total.toLocaleString();
+      if (coverageEl) coverageEl.innerText = `${percent}%`;
+      if (coverageDesc) coverageDesc.innerText = `${(total - translated).toLocaleString()} cadenas pendientes`;
+      if (tokensEl) tokensEl.innerText = `${withTokens} con Tokens`;
+    } else {
+      if (numStringsEl) numStringsEl.innerText = '0';
+      if (coverageEl) coverageEl.innerText = '0%';
+      if (coverageDesc) coverageDesc.innerText = '0 cadenas pendientes';
+      if (tokensEl) tokensEl.innerText = '0 con Tokens';
+    }
   }
 
   async function loadTmStats(): Promise<void> {
@@ -997,12 +1054,108 @@ export const TranslationStudio = (() => {
     downloadBlob(content, filename, 'text/plain;charset=utf-8');
   }
 
+  function exportStrFile(): void {
+    exportStr();
+  }
+
+  /**
+   * Restaura y carga el conjunto canónico oficial de 7.828 cadenas (.str).
+   */
+  async function loadDemoData(): Promise<void> {
+    try {
+      const res = await fetch('api/strings/seed-fixtures', { method: 'POST' });
+      const json = await res.json() as { success: boolean; projects?: StrProject[] };
+      await loadWorkspace();
+      const projId = (json.projects && json.projects[0]?.project_id) || 'sins-rebellion-core';
+      await selectProject(projId, true);
+    } catch (err) {
+      console.warn('[TranslationStudio] Error en loadDemoData:', err);
+    }
+  }
+
+  /**
+   * Carga y parsea un archivo .str subido localmente desde el explorador.
+   */
+  function handleStrUpload(e: Event): void {
+    const input = e.target as HTMLInputElement;
+    const file = input?.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (evt) => {
+      const content = (evt.target?.result as string) || '';
+      if (!content) return;
+
+      const lines = content.split(/\r?\n/);
+      let currentId = '';
+      const parsedEntries: Array<{ id: string; original: string; translated: string; tokens: string[]; status: string; entryId: number; index: number }> = [];
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]?.trim() || '';
+        const idMatch = line.match(/^StringID\s+"(.*)"$/i);
+        if (idMatch) {
+          currentId = idMatch[1]!;
+          continue;
+        }
+
+        const valMatch = line.match(/^Value\s+"(.*)"$/i);
+        if (valMatch && currentId) {
+          const val = valMatch[1]!;
+          parsedEntries.push({
+            id: currentId,
+            original: val,
+            translated: '',
+            tokens: extractTokens(val),
+            status: 'UNTRANSLATED',
+            entryId: parsedEntries.length + 1,
+            index: parsedEntries.length
+          });
+          currentId = '';
+        }
+      }
+
+      if (parsedEntries.length > 0) {
+        state.allEntries = parsedEntries;
+        state.filteredEntries = parsedEntries;
+        state.page = 1;
+
+        currentProject = {
+          project_id: 'imported-' + Date.now(),
+          name: file.name.replace(/\.[^/.]+$/, ''),
+          version: 'v1.85 Rebellion',
+          base_file_path: file.name,
+          target_file_path: file.name,
+          total_strings: parsedEntries.length,
+          translated_count: 0
+        };
+
+        const navMod = document.getElementById('live-nav-mod-name');
+        const navFile = document.getElementById('live-nav-file-name');
+        if (navMod) {
+          navMod.innerText = currentProject.name;
+          navMod.setAttribute('title', currentProject.name);
+        }
+        if (navFile) {
+          navFile.innerText = file.name;
+          navFile.setAttribute('title', file.name);
+        }
+
+        enterLiveEditor(currentProject.project_id);
+        updateTelemetry();
+      } else {
+        alert('No se pudieron extraer cadenas válidas del archivo .str.');
+      }
+    };
+    reader.readAsText(file, 'UTF-8');
+    input.value = '';
+  }
+
   function init(): void {
     if (_initialized) return;
     _initialized = true;
 
     // Delegación en documento para captura global de modales y acciones
-    document.addEventListener('click', (e: MouseEvent) => {
+    document.addEventListener('click', async (e: MouseEvent) => {
       const target = (e.target as HTMLElement | null)?.closest('[data-action]') as HTMLElement | null;
       if (!target) return;
       const action = target.dataset.action;
@@ -1037,6 +1190,18 @@ export const TranslationStudio = (() => {
         exportStr();
       } else if (action === 'workspace:refresh') {
         loadWorkspace();
+      } else if (action === 'workspace:seed-fixtures') {
+        try {
+          const res = await fetch('api/strings/seed-fixtures', { method: 'POST' });
+          const json = await res.json() as { success: boolean; error?: string };
+          if (json.success) {
+            await loadWorkspace();
+          } else {
+            alert('Error al restaurar proyecto: ' + (json.error || 'Error'));
+          }
+        } catch (err) {
+          console.warn('[TranslationStudio] Error en seed-fixtures:', err);
+        }
       } else if (action === 'workspace:upload') {
         (document.getElementById('file-input-str') as HTMLInputElement | null)?.click();
       } else if (action === 'live:auto-propagate') {
@@ -1140,6 +1305,12 @@ export const TranslationStudio = (() => {
       syncNavigationState(true);
     }
 
+    // Listeners para carga de archivos .str externos
+    const fileInputStr = document.getElementById('file-input-str') as HTMLInputElement | null;
+    if (fileInputStr) fileInputStr.addEventListener('change', handleStrUpload);
+    const strFileInput = document.getElementById('str-file-input') as HTMLInputElement | null;
+    if (strFileInput) strFileInput.addEventListener('change', handleStrUpload);
+
     loadWorkspace();
     loadTmStats();
   }
@@ -1166,7 +1337,10 @@ export const TranslationStudio = (() => {
     closeCreateProjectModal,
     openDeleteConfirmModal,
     closeDeleteConfirmModal,
-    syncNavigationState
+    syncNavigationState,
+    loadDemoData,
+    exportStrFile,
+    handleStrUpload
   };
 
   window.TranslationStudioModule = moduleApi;

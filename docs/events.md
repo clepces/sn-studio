@@ -1,98 +1,63 @@
-# Bus de Eventos y Ciclo de Vida Reactivo - Solaris Nexus Studio
+# Bus Central de Eventos y Ciclo de Vida Reactivo - Solaris Nexus Studio
 
-## 1. Principio de Gobernanza de Eventos
-Para evitar dependencias circulares y código espagueti entre controladores visuales y módulos de datos, todos los componentes se comunican exclusivamente a través del **Bus Central de Eventos**. Ningún componente invoca directamente métodos internos de otro componente.
+## 1. Arquitectura Basada en Eventos (Pub/Sub)
 
-```
-       +-----------------------------------------+
-       |       BUS CENTRAL DE EVENTOS (PUB/SUB)  |
-       +----+-----------------+-------------+----+
-            ▲                 ▲             │
-            │ Publica         │ Publica     │ Notifica
-            │                 │             ▼
-     +------+------+   +------+------+  +---+-----------+
-     | Búsqueda /  |   | Gestor VFS /|  | Grilla /      |
-     | Inputs UI   |   | Mods        |  | Paginador     |
-     +-------------+   +-------------+  +---------------+
+Solaris Nexus Studio implementa un bus de eventos desacoplado en TypeScript (`src/frontend/state/event-bus.ts`) que garantiza la sincronización en tiempo real entre los submódulos de la aplicación sin acoplamiento directo entre vistas.
+
+```text
+[ Vistas / Módulos UI ]  ── emit(evento, datos) ──►  [ GlobalEventBus ]
+                                                            │
+                                                            ▼
+                                                   [ Suscriptores / Store ]
+                                                   (AppStore, Telemetry, UI)
 ```
 
 ---
 
-## 2. Implementación del Bus en Frontend (`src/frontend/state/event-bus.ts`)
+## 2. Catálogo Canónico de Eventos
+
+### 2.1 Eventos del Sistema y Entorno
+* `system:ready`: Emitido cuando el cliente completa la verificación inicial de salud (`SystemApiClient.getHealth()`).
+* `system:environment-loaded`: Emitido cuando los datos del juego, mods y telemetría de memoria se cargan desde `/api/system/environment`.
+* `system:execution-logged`: Notifica que una nueva acción fue registrada en el historial.
+
+### 2.2 Eventos de Localización y Cadenas (.str)
+* `project:selected`: Emitido al cambiar el proyecto activo en el espacio de trabajo. Carga las cadenas asociadas en la tabla virtual y sincroniza la subpestaña de telemetría.
+* `project:created`: Notifica la creación de un nuevo proyecto `.str`.
+* `project:deleted`: Notifica la eliminación de un proyecto, disparando la actualización del workspace y los empty states correspondientes.
+* `string:saved`: Emitido cuando una traducción individual es guardada en el backend.
+* `string:validated`: Notifica el resultado del análisis sintáctico de **Token Guard**.
+
+### 2.3 Eventos de VFS y Mods
+* `mods:hierarchy-updated`: Emitido al reorganizar el orden de carga en `EnabledMods.txt`.
+* `minimod:toggled`: Notifica la activación o desactivación del parche de localización P999.
+* `ram-budget:calculated`: Notifica la actualización del presupuesto de memoria virtual LAA (límite de 3.250 MB).
+
+### 2.4 Eventos de Interfaz y Navegación
+* `view:switched`: Emitido al alternar entre las 12 vistas maestras (`dashboard`, `studio`, `translation`, `mods`, etc.).
+* `sidebar:toggled`: Notifica el colapso o expansión del menú lateral.
+* `theme:changed`: Notifica el cambio de modo de color (`light`, `dark`) o tema de superficie (`base`, `neumorphism`, `glassmorphism`).
+
+---
+
+## 3. Ejemplo de Uso en TypeScript
 
 ```typescript
-type EventCallback<T = unknown> = (payload: T) => void;
+import { GlobalEventBus } from '@/state/event-bus';
 
-export class NexusEventBus {
-  private static instance: NexusEventBus;
-  private listeners: Map<string, Set<EventCallback>> = new Map();
+// Suscripción
+const unsubscribe = GlobalEventBus.on('project:selected', (project) => {
+  console.info(`Proyecto activo cambiado a: ${project.name}`);
+  updateTelemetryView(project);
+});
 
-  public static getInstance(): NexusEventBus {
-    if (!NexusEventBus.instance) {
-      NexusEventBus.instance = new NexusEventBus();
-    }
-    return NexusEventBus.instance;
-  }
+// Emisión
+GlobalEventBus.emit('project:selected', {
+  project_id: 'sins-rebellion-core',
+  name: 'Sins Base Rebellion English.str',
+  total_strings: 7828
+});
 
-  public on<T>(event: string, callback: EventCallback<T>): () => void {
-    if (!this.listeners.has(event)) {
-      this.listeners.set(event, new Set());
-    }
-    this.listeners.get(event)!.add(callback as EventCallback);
-
-    // Retorna función de desuscripción automática
-    return () => this.off(event, callback as EventCallback);
-  }
-
-  public off(event: string, callback: EventCallback): void {
-    const eventListeners = this.listeners.get(event);
-    if (eventListeners) {
-      eventListeners.delete(callback);
-    }
-  }
-
-  public emit<T>(event: string, payload: T): void {
-    const eventListeners = this.listeners.get(event);
-    if (eventListeners) {
-      eventListeners.forEach(cb => cb(payload));
-    }
-  }
-}
-
-export const eventBus = NexusEventBus.getInstance();
+// Cancelación de suscripción
+// unsubscribe();
 ```
-
----
-
-## 3. Catálogo Canónico de Eventos del Sistema
-
-### 3.1 Canales de Búsqueda y Navegación UI
-| Canal de Evento | Emisor | Payload | Descripción |
-| :--- | :--- | :--- | :--- |
-| `search:input` | Inputs de búsqueda | `{ query: string, targetTable: string }` | Disparado al teclear en el input de búsqueda. |
-| `search:cleared` | Inputs de búsqueda | `{ targetTable: string }` | Disparado cuando el input se vacía. Provoca reseteo instantáneo de filtros. |
-| `pagination:change` | Barra de paginación | `{ page: number, target: string }` | Notifica cambio de página para rebanar el dataset visual. |
-| `tab:change` | Navegación y Carrusel | `{ tabId: string, previousTab: string }` | Notifica alternancia de vista activa. |
-
-### 3.2 Canales de Localización y Diccionarios (.STR)
-| Canal de Evento | Emisor | Payload | Descripción |
-| :--- | :--- | :--- | :--- |
-| `str:loaded` | Parser `.str` | `{ fileName: string, totalStrings: number, strings: [] }` | Notifica que un archivo léxico fue cargado y verificado. |
-| `str:updated` | Live Editor | `{ id: string, originalText: string, translatedText: string }` | Notifica modificación de una cadena individual. |
-| `str:token-violation` | Token Guard | `{ id: string, expectedTokens: string[], missing: string[] }` | Notifica que una traducción alteró variables protegidas (`{0}`, `{1}`). |
-| `str:saved` | Synthesizer | `{ filePath: string, count: number, timestamp: string }` | Notifica exportación exitosa a disco en formato TXT/TXT2. |
-
-### 3.3 Canales de Mods y Archivos Virtuales (VFS)
-| Canal de Evento | Emisor | Payload | Descripción |
-| :--- | :--- | :--- | :--- |
-| `mod:status-toggled` | Gestor de Mods | `{ modName: string, enabled: boolean }` | Notifica activación o desactivación de un mod. |
-| `mod:priority-changed` | Jerarquía VFS | `{ order: string[] }` | Notifica reordenamiento en `EnabledMods.txt`. |
-| `mod:collision-detected` | Auditor VFS | `{ file: string, conflictingMods: string[] }` | Notifica que múltiples mods sobrescriben el mismo asset del juego. |
-| `mod:installed` | Inyector Minimod | `{ modId: string, level: 1 \| 2 \| 3 }` | Notifica instalación de un mod con su nivel de impacto. |
-
-### 3.4 Canales de Telemetría y Rendimiento
-| Canal de Evento | Emisor | Payload | Descripción |
-| :--- | :--- | :--- | :--- |
-| `ram:telemetry-update` | RAM Profiler | `{ usedMb: number, limitMb: 3500, riskLevel: string }` | Actualiza el indicador de memoria virtual de 32 bits (LAA). |
-| `ram:threshold-alert` | RAM Profiler | `{ currentMb: number, message: string }` | Alerta de proximidad al techo crítico de 3.2 GB - 3.8 GB. |
-| `system:health-check` | System Health | `{ phpVersion: string, wampStatus: string, gameFound: boolean }` | Notifica diagnóstico general del entorno local. |
